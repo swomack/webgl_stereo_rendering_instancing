@@ -1,0 +1,568 @@
+<!doctype html>
+<!--
+Copyright 2016 The Chromium Authors. All rights reserved.
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file.
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+
+    <!-- Origin Trial Token, feature = WebVR (For Chrome M59+), origin = https://webvr.info, expires = 2017-10-13 -->
+    <meta http-equiv="origin-trial" data-feature="WebVR (For Chrome M59+)" data-expires="2017-10-13" content="Aqw0TUvp8CwZmgIS50pM1blhzy05y7OkBeW3AQQGjer4KuKV0p13xfrRbe2bT8B1+DgRW0O3Dda0yOjcL46GBwgAAABMeyJvcmlnaW4iOiJodHRwczovL3dlYnZyLmluZm86NDQzIiwiZmVhdHVyZSI6IldlYlZSMS4xIiwiZXhwaXJ5IjoxNTA3ODU5MDE4fQ==">
+
+    <title>05 - Room Scale</title>
+
+    <!--
+      This sample demonstrates how to create scenes that align with the space
+      physically available to the user (when that information is available).
+    -->
+
+    <style>
+        #webgl-canvas {
+            box-sizing: border-box;
+            height: 100%;
+            left: 0;
+            margin: 0;
+            position: absolute;
+            top: 0;
+            width: 100%;
+        }
+    </style>
+
+    <!-- This entire block in only to facilitate dynamically enabling and
+    disabling the WebVR polyfill, and is not necessary for most WebVR apps.
+    If you want to use the polyfill in your app, just include the js file and
+    everything will work the way you want it to by default. -->
+    <script>
+        var WebVRConfig = {
+            // Prevents the polyfill from initializing automatically.
+            DEFER_INITIALIZATION: true,
+            // Ensures the polyfill is always active when initialized, even if the
+            // native API is available. This is probably NOT what most pages want.
+            ALWAYS_APPEND_POLYFILL_DISPLAY: true,
+            // Polyfill optimizations
+            DIRTY_SUBMIT_FRAME_BINDINGS: true,
+            BUFFER_SCALE: 0.75,
+        };
+    </script>
+    <script src="js/webvr-polyfill.js"></script>
+    <script src="js/wglu-url.js"></script>
+    <script>
+        // Dynamically turn the polyfill on if requested by the query args.
+        if (WGLUUrl.getBool('polyfill', false)) {
+            InitializeWebVRPolyfill();
+        } else {
+            // Shim for migration from older version of WebVR. Shouldn't be necessary for very long.
+           // InitializeSpecShim();
+        }
+    </script>
+    <!-- End sample polyfill enabling logic -->
+
+    <script src="js/gl-matrix-min.js"></script>
+
+    <script src="js/wglu-debug-geometry.js"></script>
+    <script src="js/wglu-program.js"></script>
+    <script src="js/wglu-stats.js"></script>
+    <script src="js/wglu-texture.js"></script>
+
+    <script src="js/vr-cube-island.js"></script>
+    <script src="js/vr-samples-util.js"></script>
+</head>
+<body>
+<canvas id="webgl-canvas"></canvas>
+<script>
+    /* global mat4, vec3, VRCubeIsland, WGLUDebugGeometry, WGLUStats, WGLUTextureLoader, VRSamplesUtil */
+    (function () {
+        "use strict";
+
+
+        var vertCode = 'attribute vec3 position;\n'+
+            'uniform mat4 Pmatrix[2];\n'+
+            'uniform mat4 Vmatrix[2];\n'+
+            'uniform mat4 Mmatrix;\n'+
+            'attribute vec3 color;\n'+//the color of the point
+            'varying vec3 vColor;\n' +
+            'attribute float instance;\n' +
+            'varying float vInstance;\n' +
+            'uniform float EyeOffsetScale[2];\n' +
+            'varying float clip_x;\n' +
+            'void main(void) { \n' +
+            'int index = int(instance);\n' +
+            'vec4 clip_pos = Pmatrix[index] * Vmatrix[index] * Mmatrix * vec4(position, 1.);\n' +
+            'clip_pos.x *= 0.5;\n' +
+            'clip_pos.x += EyeOffsetScale[index] * clip_pos.w;\n' +
+            'gl_Position = clip_pos;\n'+
+            'vColor = color;\n' +
+            'vInstance = instance;\n' +
+            'clip_x = clip_pos.x;\n'+
+            '}';
+
+        var fragCode = 'precision mediump float;\n' +
+            'varying float vInstance;\n'+
+            'varying vec3 vColor;\n' +
+            'varying float clip_x;\n'+
+            'void main(void) {\n' +
+            'if (vInstance > 0.7 && clip_x < 0.0) {\n' +
+            'discard;\n' +
+            'return;\n' +
+            '}\n' +
+            'if (vInstance < 0.7 && clip_x > 0.0) {\n' +
+            'discard;\n' +
+            'return;\n' +
+            '}\n'+
+            'gl_FragColor = vec4(vColor, 1.);\n'+
+            '}';
+
+        var shaderProgram;
+        var Pmatrix;
+        var Vmatrix;
+        var Mmatrix;
+        var EyeOffsetScale_location;
+        var vertex_buffer;
+        var color_buffer;
+        var index_buffer;
+        var instance_buffer;
+        var instance_ext;
+
+
+
+        var vertices = [
+            -1,-1,-1, 1,-1,-1, 1, 1,-1, -1, 1,-1,
+            -1,-1, 1, 1,-1, 1, 1, 1, 1, -1, 1, 1,
+            -1,-1,-1, -1, 1,-1, -1, 1, 1, -1,-1, 1,
+            1,-1,-1, 1, 1,-1, 1, 1, 1, 1,-1, 1,
+            -1,-1,-1, -1,-1, 1, 1,-1, 1, 1,-1,-1,
+            -1, 1,-1, -1, 1, 1, 1, 1, 1, 1, 1,-1,
+        ];
+
+        var colors = [
+            5,3,7, 5,3,7, 5,3,7, 5,3,7,
+            1,1,3, 1,1,3, 1,1,3, 1,1,3,
+            0,0,1, 0,0,1, 0,0,1, 0,0,1,
+            1,0,0, 1,0,0, 1,0,0, 1,0,0,
+            1,1,0, 1,1,0, 1,1,0, 1,1,0,
+            0,1,0, 0,1,0, 0,1,0, 0,1,0
+        ];
+
+        var indices = [
+            0,1,2, 0,2,3, 4,5,6, 4,6,7,
+            8,9,10, 8,10,11, 12,13,14, 12,14,15,
+            16,17,18, 16,18,19, 20,21,22, 20,22,23
+        ];
+
+        var instances = [0, 1];
+
+        let  EyeOffsetScale = [-0.5, 0.5];
+
+        function get_projection(angle, a, zMin, zMax) {
+            var ang = Math.tan((angle*.5)*Math.PI/180);//angle*.5
+            return [
+                0.5/ang, 0 , 0, 0,
+                0, 0.5*a/ang, 0, 0,
+                0, 0, -(zMax+zMin)/(zMax-zMin), -1,
+                0, 0, (-2*zMax*zMin)/(zMax-zMin), 0
+            ];
+        }
+
+
+        var proj_matrix;
+
+        var mov_matrix = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-5,1];
+        var view_matrix = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+
+        // translating z
+        view_matrix[14] = view_matrix[14]-6;//zoom
+
+
+
+
+
+
+
+        var PLAYER_HEIGHT = 1.65;
+        var vrDisplay = null;
+        var frameData = null;
+        var projectionMat = mat4.create();
+        var viewMat = mat4.create();
+        var viewMat_left = mat4.create();
+        var viewMat_right = mat4.create();
+        var vrPresentButton = null;
+
+        var gl = null;
+
+        var stats = null;
+        var debugGeom = null;
+        function onContextLost( event ) {
+            event.preventDefault();
+            console.log( 'WebGL Context Lost.' );
+            gl = null;
+
+            debugGeom = null;
+            stats = null;
+        }
+
+        function onContextRestored( event ) {
+            console.log( 'WebGL Context Restored.' );
+            initWebGL(vrDisplay ? vrDisplay.capabilities.hasExternalDisplay : false);
+        }
+
+        var webglCanvas = document.getElementById("webgl-canvas");
+        webglCanvas.addEventListener( 'webglcontextlost', onContextLost, false );
+        webglCanvas.addEventListener( 'webglcontextrestored', onContextRestored, false );
+
+
+        function initWebGL (preserveDrawingBuffer) {
+            var glAttribs = {
+                alpha: false,
+                preserveDrawingBuffer: preserveDrawingBuffer
+            };
+            var useWebgl2 = WGLUUrl.getBool('webgl2', false);
+            var contextTypes = useWebgl2 ? ["webgl2"] : ["webgl", "experimental-webgl"];
+            for (var i in contextTypes) {
+                gl = webglCanvas.getContext(contextTypes[i], glAttribs);
+                if (gl)
+                    break;
+            }
+            if (!gl) {
+                var webglType = (useWebgl2 ? "WebGL 2" : "WebGL")
+                VRSamplesUtil.addError("Your browser does not support " + webglType + ".");
+                return;
+            }
+            gl.clearColor(0.1, 0.2, 0.3, 1.0);
+            gl.enable(gl.DEPTH_TEST);
+            gl.enable(gl.CULL_FACE);
+
+
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+            var enablePerformanceMonitoring = WGLUUrl.getBool(
+                'enablePerformanceMonitoring', false);
+
+            stats = new WGLUStats(gl, enablePerformanceMonitoring);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            // create and compile shaders
+            var vertShader = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vertShader, vertCode);
+            gl.compileShader(vertShader);
+
+            if (!gl.getShaderParameter(vertShader, gl.COMPILE_STATUS)) {
+                console.log(vertCode);
+                console.log('ERROR compiling vertex shader!: ' + gl.getShaderInfoLog(vertShader));
+            }
+
+            var fragShader = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fragShader, fragCode);
+            gl.compileShader(fragShader);
+
+            if (!gl.getShaderParameter(fragShader, gl.COMPILE_STATUS)) {
+                console.log(fragCode);
+                console.log('ERROR compiling fragment shader!: ' + gl.getShaderInfoLog(fragShader));
+            }
+
+            shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertShader);
+            gl.attachShader(shaderProgram, fragShader);
+            gl.linkProgram(shaderProgram);
+
+
+
+            /* ====== Associating attributes to vertex shader =====*/
+            Pmatrix = gl.getUniformLocation(shaderProgram, "Pmatrix");
+            Vmatrix = gl.getUniformLocation(shaderProgram, "Vmatrix");
+            Mmatrix = gl.getUniformLocation(shaderProgram, "Mmatrix");
+            EyeOffsetScale_location = gl.getUniformLocation(shaderProgram, "EyeOffsetScale")
+
+
+            // Create and store data into vertex buffer
+            vertex_buffer = gl.createBuffer ();
+            gl.bindBuffer(gl.ARRAY_BUFFER, vertex_buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+
+            // Create and store data into color buffer
+            color_buffer = gl.createBuffer ();
+            gl.bindBuffer(gl.ARRAY_BUFFER, color_buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.STATIC_DRAW);
+
+            // Create and store data into index buffer
+            index_buffer = gl.createBuffer ();
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index_buffer);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+
+
+            instance_buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, instance_buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(instances), gl.STATIC_DRAW);
+
+            // Position
+            gl.bindBuffer(gl.ARRAY_BUFFER, vertex_buffer);
+            var position_location = gl.getAttribLocation(shaderProgram, "position");
+            gl.vertexAttribPointer(position_location, 3, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(position_location);
+
+            // Color
+            gl.bindBuffer(gl.ARRAY_BUFFER, color_buffer);
+            var color_position = gl.getAttribLocation(shaderProgram, "color");
+            gl.vertexAttribPointer(color_position, 3, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(color_position);
+
+
+            instance_ext = gl.getExtension("ANGLE_instanced_arrays"); // Vendor prefixes may apply!
+            // instances
+            gl.bindBuffer(gl.ARRAY_BUFFER, instance_buffer);
+            var instance_location = gl.getAttribLocation(shaderProgram, "instance");
+            gl.enableVertexAttribArray(instance_location);
+            gl.vertexAttribPointer(instance_location, 1, gl.FLOAT, false, 0, 0);
+            instance_ext.vertexAttribDivisorANGLE(instance_location, 1); // This makes it instanced!
+
+
+            proj_matrix = get_projection(40, webglCanvas.width/webglCanvas.height, 1, 100);
+
+
+
+
+            gl.useProgram(shaderProgram);
+
+
+
+
+            // Wait until we have a WebGL context to resize and start rendering.
+            window.addEventListener("resize", onResize, false);
+            onResize();
+            window.requestAnimationFrame(onAnimationFrame);
+
+        }
+        // ================================
+        // WebVR-specific code begins here.
+        // ================================
+        function onVRRequestPresent () {
+            vrDisplay.requestPresent([{ source: webglCanvas }]).then(function () {
+            }, function (err) {
+                var errMsg = "requestPresent failed.";
+                if (err && err.message) {
+                    errMsg += "<br/>" + err.message
+                }
+                VRSamplesUtil.addError(errMsg, 2000);
+            });
+        }
+
+        function onVRExitPresent () {
+            if (!vrDisplay.isPresenting)
+                return;
+            vrDisplay.exitPresent().then(function () {
+            }, function () {
+                VRSamplesUtil.addError("exitPresent failed.", 2000);
+            });
+        }
+
+        function onVRPresentChange () {
+            onResize();
+            if (vrDisplay.isPresenting) {
+                if (vrDisplay.capabilities.hasExternalDisplay) {
+                    VRSamplesUtil.removeButton(vrPresentButton);
+                    vrPresentButton = VRSamplesUtil.addButton("Exit VR", "E", "media/icons/cardboard64.png", onVRExitPresent);
+                }
+            } else {
+                if (vrDisplay.capabilities.hasExternalDisplay) {
+                    VRSamplesUtil.removeButton(vrPresentButton);
+                    vrPresentButton = VRSamplesUtil.addButton("Enter VR", "E", "media/icons/cardboard64.png", onVRRequestPresent);
+                }
+            }
+        }
+
+        if (navigator.getVRDisplays) {
+            frameData = new VRFrameData();
+            navigator.getVRDisplays().then(function (displays) {
+                if (displays.length > 0) {
+                    vrDisplay = displays[displays.length - 1];
+                    vrDisplay.depthNear = 0.1;
+                    vrDisplay.depthFar = 1024.0;
+                    initWebGL(vrDisplay.capabilities.hasExternalDisplay);
+
+                    if (vrDisplay.capabilities.canPresent)
+                        vrPresentButton = VRSamplesUtil.addButton("Enter VR", "E", "media/icons/cardboard64.png", onVRRequestPresent);
+
+                    if (vrDisplay.capabilities.canPresent && WGLUUrl.getBool('canvasClickPresents', false))
+                        webglCanvas.addEventListener("click", onVRRequestPresent, false);
+                    window.addEventListener('vrdisplaypresentchange', onVRPresentChange, false);
+                    window.addEventListener('vrdisplayactivate', onVRRequestPresent, false);
+                    window.addEventListener('vrdisplaydeactivate', onVRExitPresent, false);
+                } else {
+                    initWebGL(false);
+                    VRSamplesUtil.addInfo("WebVR supported, but no VRDisplays found.", 3000);
+                }
+            }, function () {
+                VRSamplesUtil.addError("Your browser does not support WebVR. See <a href='http://webvr.info'>webvr.info</a> for assistance.");
+            });
+        } else if (navigator.getVRDevices) {
+            initWebGL(false);
+            VRSamplesUtil.addError("Your browser supports WebVR but not the latest version. See <a href='http://webvr.info'>webvr.info</a> for more info.");
+        } else {
+            initWebGL(false);
+            VRSamplesUtil.addError("Your browser does not support WebVR. See <a href='http://webvr.info'>webvr.info</a> for assistance.");
+        }
+
+
+        function onResize () {
+            if (vrDisplay && vrDisplay.isPresenting) {
+                var leftEye = vrDisplay.getEyeParameters("left");
+                var rightEye = vrDisplay.getEyeParameters("right");
+                webglCanvas.width = Math.max(leftEye.renderWidth, rightEye.renderWidth) * 2;
+                webglCanvas.height = Math.max(leftEye.renderHeight, rightEye.renderHeight);
+            } else {
+                webglCanvas.width = webglCanvas.offsetWidth * window.devicePixelRatio;
+                webglCanvas.height = webglCanvas.offsetHeight * window.devicePixelRatio;
+            }
+        }
+
+
+        function onClick () {
+            // Reset the background color to a random value
+//            if (gl) {
+//                gl.clearColor(
+//                    Math.random() * 0.5,
+//                    Math.random() * 0.5,
+//                    Math.random() * 0.5, 1.0);
+//            }
+        }
+
+
+        function onDisplayPointerRestricted() {
+            if (webglCanvas && webglCanvas.requestPointerLock) {
+                webglCanvas.requestPointerLock();
+            }
+        }
+
+        function onDisplayPointerUnrestricted() {
+            var lock = document.pointerLockElement;
+            if (lock && lock === webglCanvas && document.exitPointerLock) {
+                document.exitPointerLock();
+            }
+        }
+
+        webglCanvas.addEventListener("click", onClick, false);
+        window.addEventListener('vrdisplaypointerrestricted', onDisplayPointerRestricted);
+        window.addEventListener('vrdisplaypointerunrestricted', onDisplayPointerUnrestricted);
+
+        function getStandingViewMatrix (out, view) {
+            if (vrDisplay.stageParameters) {
+                mat4.invert(out, vrDisplay.stageParameters.sittingToStandingTransform);
+                mat4.multiply(out, view, out);
+            } else {
+                mat4.identity(out);
+                mat4.translate(out, out, [0, PLAYER_HEIGHT, 0]);
+                mat4.invert(out, out);
+                mat4.multiply(out, view, out);
+            }
+        }
+
+
+        let p_m = new Float32Array(32);
+        let v_m = new Float32Array(32);
+
+        function renderSceneView (projection_matrices, view_matrices, pose) {
+
+//            var orientation = pose.orientation;
+//            var position = pose.position;
+//            if (!orientation) { orientation = [0, 0, 0, 1]; }
+//            if (!position) { position = [0, 0, 0]; }
+//
+           // debugGeom.bind(projection, view);
+//
+         //   debugGeom.drawCube(orientation, position, 0.2, [0, 0, 1, 1]);
+
+
+
+            //gl.uniformMatrix4fv(Pmatrix, false, proj_matrix);
+            //gl.uniformMatrix4fv(Vmatrix, false, view_matrix);
+
+
+            p_m.set(projection_matrices[0], 0);
+            p_m.set(projection_matrices[1], 16);
+
+            v_m.set(view_matrices[0], 0);
+            v_m.set(view_matrices[1], 16);
+
+            gl.uniformMatrix4fv(Pmatrix, false, p_m);
+            gl.uniformMatrix4fv(Vmatrix, false, v_m);
+
+            gl.uniformMatrix4fv(Mmatrix, false, mov_matrix);
+            gl.uniform1fv(EyeOffsetScale_location, new Float32Array(EyeOffsetScale));
+
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index_buffer);
+
+            // Draw the instanced meshes
+            instance_ext.drawElementsInstancedANGLE(gl.TRIANGLES,  indices.length, gl.UNSIGNED_SHORT, 0, 2);
+        }
+
+
+
+        function onAnimationFrame (t) {
+            // do not attempt to render if there is no available WebGL context
+            if (!gl || !stats ) {
+                return;
+            }
+
+            //stats.begin();
+
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+            if (vrDisplay) {
+
+                vrDisplay.getFrameData(frameData);
+
+                if (vrDisplay.isPresenting) {
+                    gl.viewport(0, 0, webglCanvas.width, webglCanvas.height);
+                    getStandingViewMatrix(viewMat_left, frameData.leftViewMatrix);
+                    getStandingViewMatrix(viewMat_right, frameData.rightViewMatrix);
+
+                    renderSceneView([frameData.leftProjectionMatrix, frameData.rightProjectionMatrix], [viewMat_left,  viewMat_right],  frameData.pose);
+                    vrDisplay.submitFrame();
+                } else {
+                    gl.viewport(0, 0, webglCanvas.width, webglCanvas.height);
+                    getStandingViewMatrix(viewMat_left, frameData.leftViewMatrix);
+                    getStandingViewMatrix(viewMat_right, frameData.rightViewMatrix);
+
+                    renderSceneView([frameData.leftProjectionMatrix, frameData.rightProjectionMatrix], [viewMat_left,  viewMat_right],  frameData.pose);
+                }
+
+                vrDisplay.requestAnimationFrame(onAnimationFrame);
+            } else {
+
+                // No VRDisplay found.
+
+//                mat4.perspective(projectionMat, Math.PI*0.4, webglCanvas.width / webglCanvas.height, 0.1, 1024.0);
+//                mat4.identity(viewMat);
+//                mat4.translate(viewMat, viewMat, [0, -PLAYER_HEIGHT, 0]);
+
+                gl.viewport(0, 0, webglCanvas.width, webglCanvas.height);
+                renderSceneView([proj_matrix, proj_matrix], [view_matrix, view_matrix]);
+
+
+                //stats.renderOrtho();
+                window.requestAnimationFrame(onAnimationFrame);
+            }
+
+            //stats.end();
+        }
+    })();
+</script>
+</body>
+</html>
